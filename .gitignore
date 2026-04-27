@@ -1,5 +1,7 @@
 streamlit_env/
 __pycache__/
 *.pyc
+.DS_Store
 .streamlit/secrets.toml
 physician_responses.csv
+odd_one_out_trials_with_both_image_types.json
