@@ -329,7 +329,7 @@ trial_id = int(row["trial_id"])
 st.title("Odd-One-Out Image Evaluation")
 
 st.write(
-    "For each option, the generated image is shown above the extracted center-cell image. "
+    "For each option, only the generated image is shown. "
     "Select the option that looks most different from the other two."
 )
 
@@ -350,7 +350,6 @@ for outer_col, image_label, display_label in zip(outer_cols, image_labels, displ
     with outer_col:
         st.subheader(display_label)
 
-        center_path = row[f"image_{image_label}_center_cells_path"]
         gen_path = row[f"image_{image_label}_gen_imgs_path"]
 
         st.caption("Generated image")
@@ -358,12 +357,6 @@ for outer_col, image_label, display_label in zip(outer_cols, image_labels, displ
             st.error("Missing")
         else:
             st.image(Image.open(gen_path), width=IMAGE_WIDTH)
-
-        st.caption("Center cell")
-        if pd.isna(center_path) or not os.path.exists(center_path):
-            st.error("Missing")
-        else:
-            st.image(Image.open(center_path), width=IMAGE_WIDTH)
 
 # ----------------------------
 # retrieve previous answer if going back
