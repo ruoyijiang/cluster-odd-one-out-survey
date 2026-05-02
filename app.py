@@ -25,7 +25,7 @@ RESPONSES_CSV = os.path.join(
     "physician_responses.csv"
 )
 
-PARTICIPANT_IDS = ["1", "2", "3", "4"]
+PARTICIPANT_IDS = ["1", "2", "3", "4", "5"]
 PARTICIPANT_PLACEHOLDER = "Select participant"
 
 st.set_page_config(
@@ -303,7 +303,7 @@ if participant_id and participant_id != st.session_state.active_participant_id:
 
 if not participant_id:
     st.title("Odd-One-Out Image Evaluation")
-    st.info("Select one of the four participants in the sidebar to begin.")
+    st.info("Select one of the five participants in the sidebar to begin.")
     st.stop()
 
 storage_warning = gsheets_status_message()
