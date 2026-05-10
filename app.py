@@ -79,6 +79,9 @@ if "next_sheet_row" not in st.session_state:
 if "trial_order" not in st.session_state:
     st.session_state.trial_order = trials_df.index.tolist()
 
+if "pending_jump_value" not in st.session_state:
+    st.session_state.pending_jump_value = None
+
 
 def trial_order_for_participant(pid):
     return trials_df.sample(
@@ -322,6 +325,11 @@ else:
 trial_order = st.session_state.trial_order
 trial_idx = st.session_state.trial_idx
 n_trials = len(trial_order)
+jump_key = f"jump_to_trial_{participant_id}"
+
+if st.session_state.pending_jump_value is not None:
+    st.session_state[jump_key] = st.session_state.pending_jump_value
+    st.session_state.pending_jump_value = None
 
 row = trials_df.loc[trial_order[trial_idx]]
 trial_id = int(row["trial_id"])
@@ -335,6 +343,14 @@ st.write(
 
 st.progress((trial_idx + 1) / n_trials)
 st.write(f"Trial {trial_idx + 1} of {n_trials}")
+
+jump_to_trial = st.slider(
+    "Jump to trial",
+    min_value=1,
+    max_value=n_trials,
+    value=trial_idx + 1,
+    key=jump_key,
+)
 
 # ----------------------------
 # display images
@@ -365,13 +381,14 @@ prev = st.session_state.answers.get(trial_id, {})
 
 default_answer = prev.get("selected_answer")
 default_choice = answer_to_display.get(default_answer)
+choice_key = f"choice_{participant_id}_{trial_id}"
 
 selected = st.radio(
     "Which option is the odd one out?",
     display_choices,
     index=display_choices.index(default_choice) if default_choice else None,
     horizontal=True,
-    key=f"choice_{trial_id}"
+    key=choice_key,
 )
 
 # ----------------------------
@@ -452,6 +469,12 @@ if current_selected_answer and prev.get("selected_answer") != current_selected_a
     save_current_answer()
     persist_current_answer()
 
+if jump_to_trial != trial_idx + 1:
+    save_current_answer()
+    persist_current_answer()
+    st.session_state.trial_idx = jump_to_trial - 1
+    st.rerun()
+
 
 def enable_keyboard_shortcuts():
     components.html(
@@ -528,7 +551,7 @@ def enable_keyboard_shortcuts():
           if (key === "k") {
             event.preventDefault();
             event.stopPropagation();
-            if (clickButtonByText("Submit and continue") || clickButtonByText("Finish")) {
+            if (clickButtonByText("Continue") || clickButtonByText("Finish")) {
               event.stopImmediatePropagation();
             }
           }
@@ -551,6 +574,7 @@ with left:
         save_current_answer()
         persist_current_answer()
         st.session_state.trial_idx -= 1
+        st.session_state.pending_jump_value = st.session_state.trial_idx + 1
         st.rerun()
 
 with middle:
@@ -560,19 +584,20 @@ with middle:
         st.success("Progress saved.")
 
 with right:
-    next_label = "Finish" if trial_idx + 1 == n_trials else "Submit and continue"
+    next_label = "Finish" if trial_idx + 1 == n_trials else "Continue"
 
-    if st.button(next_label, disabled=selected is None):
+    if st.button(next_label):
         save_current_answer()
         persist_current_answer()
 
         if trial_idx + 1 < n_trials:
             st.session_state.trial_idx += 1
+            st.session_state.pending_jump_value = st.session_state.trial_idx + 1
             st.rerun()
         else:
             st.success("Evaluation complete. Thank you.")
 
-st.caption("Keyboard shortcuts: press 1/2/3 to choose, J for Back, K for Submit and continue.")
+st.caption("Keyboard shortcuts: press 1/2/3 to choose, J for Back, K for Continue.")
 enable_keyboard_shortcuts()
 
 is_complete = len(st.session_state.answers) == n_trials
