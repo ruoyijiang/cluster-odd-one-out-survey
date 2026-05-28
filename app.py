@@ -1,5 +1,6 @@
 import os
 import time
+import hashlib
 from datetime import datetime
 
 import pandas as pd
@@ -91,9 +92,10 @@ if "cloud_sync_warning" not in st.session_state:
 
 
 def trial_order_for_participant(pid):
+    seed = int(hashlib.sha256(str(pid).encode("utf-8")).hexdigest()[:8], 16)
     return trials_df.sample(
         frac=1,
-        random_state=abs(hash(pid)) % (2**32)
+        random_state=seed
     ).index.tolist()
 
 
@@ -339,6 +341,15 @@ def next_trial_index(trial_order, answers):
     return max(len(trial_order) - 1, 0)
 
 
+def initialize_answer_widget_state(pid, answers):
+    answer_to_display = {"A": "1", "B": "2", "C": "3"}
+    for trial_id, answer in answers.items():
+        selected_answer = answer.get("selected_answer")
+        display_answer = answer_to_display.get(selected_answer)
+        if display_answer:
+            st.session_state[f"choice_{pid}_{trial_id}"] = display_answer
+
+
 def reset_for_participant(pid):
     trial_order = trial_order_for_participant(pid)
     answers, answer_rows, next_sheet_row = load_saved_answers_and_rows(pid)
@@ -350,6 +361,9 @@ def reset_for_participant(pid):
     st.session_state.next_sheet_row = next_sheet_row
     st.session_state.trial_order = trial_order
     st.session_state.trial_idx = next_trial_index(trial_order, answers)
+    st.session_state.pending_jump_value = None
+    st.session_state.pending_sync_trial_ids = []
+    initialize_answer_widget_state(pid, answers)
 
 
 # ----------------------------
@@ -536,6 +550,13 @@ def persist_current_answer():
                 break
         else:
             next_row = st.session_state.next_sheet_row
+            if next_row <= 2:
+                header_result = run_gsheets_call(
+                    "ensure Google Sheets response header",
+                    lambda: worksheet.update("A1:J1", [get_response_columns()])
+                )
+                if header_result is None:
+                    break
             result = run_gsheets_call(
                 "append a response to Google Sheets",
                 lambda row_values=row_values: worksheet.append_row(row_values)
