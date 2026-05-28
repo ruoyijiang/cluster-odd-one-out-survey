@@ -99,6 +99,34 @@ def trial_order_for_participant(pid):
     ).index.tolist()
 
 
+def build_response_row(pid, trial_number, trial_row, selected_answer=""):
+    correct_answer = trial_row["correct_answer"]
+    has_answer = selected_answer in {"A", "B", "C"}
+    return {
+        "timestamp": datetime.now().isoformat() if has_answer else "",
+        "participant_id": str(pid),
+        "trial_number": trial_number,
+        "trial_id": int(trial_row["trial_id"]),
+        "cluster_pair": trial_row["cluster_pair"],
+        "anchor_cluster": trial_row["anchor_cluster"],
+        "distractor_cluster": trial_row["distractor_cluster"],
+        "selected_answer": selected_answer if has_answer else "",
+        "correct_answer": correct_answer,
+        "is_correct": str(selected_answer == correct_answer) if has_answer else "",
+    }
+
+
+def blank_response_rows_for_participant(pid, trial_order):
+    return [
+        build_response_row(pid, trial_number, trials_df.loc[row_idx])
+        for trial_number, row_idx in enumerate(trial_order, start=1)
+    ]
+
+
+def row_to_values(row):
+    return [str(row.get(column, "")) for column in get_response_columns()]
+
+
 def get_gsheets_config():
     try:
         gsheets_config = st.secrets["connections"]["gsheets"]
@@ -159,6 +187,15 @@ def unique_trial_ids(trial_ids):
             ordered.append(trial_id)
             seen.add(trial_id)
     return ordered
+
+
+def normalize_trial_id(value):
+    if pd.isna(value) or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def mark_pending_sync(trial_ids):
@@ -254,6 +291,13 @@ def read_responses_df():
     return pd.DataFrame(columns=get_response_columns())
 
 
+def responses_for_participant(pid):
+    response_df = read_responses_df()
+    if response_df.empty:
+        return response_df
+    return response_df[response_df["participant_id"].astype(str) == str(pid)]
+
+
 def load_saved_answers_and_rows(pid):
     if not pid:
         return {}, {}, 2
@@ -278,13 +322,16 @@ def load_saved_answers_and_rows(pid):
         if saved_df.empty:
             return {}, {}, len(records) + 2
 
-        saved_df = saved_df.drop_duplicates(subset=["trial_id"], keep="last")
+        saved_df["__trial_id"] = saved_df["trial_id"].apply(normalize_trial_id)
+        saved_df = saved_df.dropna(subset=["__trial_id"])
+        saved_df = saved_df.drop_duplicates(subset=["__trial_id"], keep="last")
+        saved_answer_df = saved_df[saved_df["selected_answer"].astype(str).isin(["A", "B", "C"])]
         answers = {
-            int(answer["trial_id"]): answer.drop(labels="__row_number").to_dict()
-            for _, answer in saved_df.iterrows()
+            int(answer["__trial_id"]): answer.drop(labels=["__row_number", "__trial_id"]).to_dict()
+            for _, answer in saved_answer_df.iterrows()
         }
         answer_rows = {
-            int(answer["trial_id"]): int(answer["__row_number"])
+            int(answer["__trial_id"]): int(answer["__row_number"])
             for _, answer in saved_df.iterrows()
         }
         return answers, answer_rows, len(records) + 2
@@ -294,10 +341,13 @@ def load_saved_answers_and_rows(pid):
     if saved_df.empty:
         return {}, {}, 2
 
-    saved_df = saved_df.drop_duplicates(subset=["trial_id"], keep="last")
+    saved_df["__trial_id"] = saved_df["trial_id"].apply(normalize_trial_id)
+    saved_df = saved_df.dropna(subset=["__trial_id"])
+    saved_df = saved_df.drop_duplicates(subset=["__trial_id"], keep="last")
+    saved_answer_df = saved_df[saved_df["selected_answer"].astype(str).isin(["A", "B", "C"])]
     answers = {
-        int(answer["trial_id"]): answer.to_dict()
-        for _, answer in saved_df.iterrows()
+        int(answer["__trial_id"]): answer.drop(labels="__trial_id").to_dict()
+        for _, answer in saved_answer_df.iterrows()
     }
     return answers, {}, 2
 
@@ -326,6 +376,46 @@ def write_responses_df(response_df):
         return
 
     ordered_df.to_csv(RESPONSES_CSV, index=False)
+
+
+def ensure_participant_rows(pid, trial_order, answer_rows):
+    if get_storage_mode() != "gsheets":
+        return answer_rows, None
+
+    worksheet = get_gsheet_worksheet()
+    if worksheet is None:
+        return answer_rows, None
+
+    missing_rows = [
+        row
+        for row in blank_response_rows_for_participant(pid, trial_order)
+        if row["trial_id"] not in answer_rows
+    ]
+    if not missing_rows:
+        return answer_rows, None
+
+    if not answer_rows and st.session_state.next_sheet_row <= 2:
+        header_result = run_gsheets_call(
+            "ensure Google Sheets response header",
+            lambda: worksheet.update("A1:J1", [get_response_columns()])
+        )
+        if header_result is None:
+            return answer_rows, None
+
+    start_row = st.session_state.next_sheet_row
+    values = [row_to_values(row) for row in missing_rows]
+    result = run_gsheets_call(
+        "prefill participant response rows in Google Sheets",
+        lambda values=values: worksheet.append_rows(values, value_input_option="USER_ENTERED")
+    )
+    if result is None:
+        return answer_rows, None
+
+    updated_rows = dict(answer_rows)
+    for offset, row in enumerate(missing_rows):
+        updated_rows[row["trial_id"]] = start_row + offset
+
+    return updated_rows, start_row + len(missing_rows)
 
 
 def load_saved_answers(pid):
@@ -360,6 +450,10 @@ def reset_for_participant(pid):
     st.session_state.answer_rows = answer_rows
     st.session_state.next_sheet_row = next_sheet_row
     st.session_state.trial_order = trial_order
+    updated_answer_rows, updated_next_sheet_row = ensure_participant_rows(pid, trial_order, answer_rows)
+    st.session_state.answer_rows = updated_answer_rows
+    if updated_next_sheet_row is not None:
+        st.session_state.next_sheet_row = updated_next_sheet_row
     st.session_state.trial_idx = next_trial_index(trial_order, answers)
     st.session_state.pending_jump_value = None
     st.session_state.pending_sync_trial_ids = []
@@ -487,18 +581,12 @@ def save_current_answer():
         return
 
     selected_answer = display_to_answer[selected]
-    st.session_state.answers[trial_id] = {
-        "timestamp": datetime.now().isoformat(),
-        "participant_id": participant_id,
-        "trial_number": trial_idx + 1,
-        "trial_id": trial_id,
-        "cluster_pair": row["cluster_pair"],
-        "anchor_cluster": row["anchor_cluster"],
-        "distractor_cluster": row["distractor_cluster"],
-        "selected_answer": selected_answer,
-        "correct_answer": row["correct_answer"],
-        "is_correct": selected_answer == row["correct_answer"],
-    }
+    st.session_state.answers[trial_id] = build_response_row(
+        participant_id,
+        trial_idx + 1,
+        row,
+        selected_answer=selected_answer,
+    )
 
 
 def write_all_answers():
@@ -533,38 +621,35 @@ def persist_current_answer():
     for pending_trial_id in trial_ids_to_sync:
         saved_answer = st.session_state.answers.get(pending_trial_id)
         if not saved_answer:
-            synced_trial_ids.append(pending_trial_id)
-            continue
+            mark_pending_sync([pending_trial_id])
+            break
 
-        row_values = [str(saved_answer.get(column, "")) for column in get_response_columns()]
+        row_values = row_to_values(saved_answer)
         row_number = st.session_state.answer_rows.get(pending_trial_id)
 
-        if row_number:
-            result = run_gsheets_call(
-                "update a response in Google Sheets",
-                lambda row_number=row_number, row_values=row_values: (
-                    worksheet.update(f"A{row_number}:J{row_number}", [row_values])
-                )
+        if not row_number:
+            updated_answer_rows, updated_next_sheet_row = ensure_participant_rows(
+                participant_id,
+                st.session_state.trial_order,
+                st.session_state.answer_rows,
             )
-            if result is None:
-                break
-        else:
-            next_row = st.session_state.next_sheet_row
-            if next_row <= 2:
-                header_result = run_gsheets_call(
-                    "ensure Google Sheets response header",
-                    lambda: worksheet.update("A1:J1", [get_response_columns()])
-                )
-                if header_result is None:
-                    break
-            result = run_gsheets_call(
-                "append a response to Google Sheets",
-                lambda row_values=row_values: worksheet.append_row(row_values)
+            st.session_state.answer_rows = updated_answer_rows
+            if updated_next_sheet_row is not None:
+                st.session_state.next_sheet_row = updated_next_sheet_row
+            row_number = st.session_state.answer_rows.get(pending_trial_id)
+
+        if not row_number:
+            mark_pending_sync([pending_trial_id])
+            break
+
+        result = run_gsheets_call(
+            "update a response in Google Sheets",
+            lambda row_number=row_number, row_values=row_values: (
+                worksheet.update(f"A{row_number}:J{row_number}", [row_values])
             )
-            if result is None:
-                break
-            st.session_state.answer_rows[pending_trial_id] = next_row
-            st.session_state.next_sheet_row += 1
+        )
+        if result is None:
+            break
 
         synced_trial_ids.append(pending_trial_id)
 
@@ -575,7 +660,9 @@ def persist_current_answer():
 
 
 def current_participant_export():
-    export_df = pd.DataFrame(list(st.session_state.answers.values()))
+    export_df = responses_for_participant(participant_id)
+    if export_df.empty:
+        export_df = pd.DataFrame(list(st.session_state.answers.values()))
     if export_df.empty:
         return b""
 
