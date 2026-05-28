@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -82,6 +83,12 @@ if "trial_order" not in st.session_state:
 if "pending_jump_value" not in st.session_state:
     st.session_state.pending_jump_value = None
 
+if "pending_sync_trial_ids" not in st.session_state:
+    st.session_state.pending_sync_trial_ids = []
+
+if "cloud_sync_warning" not in st.session_state:
+    st.session_state.cloud_sync_warning = None
+
 
 def trial_order_for_participant(pid):
     return trials_df.sample(
@@ -134,7 +141,60 @@ def gsheets_status_message():
     return None
 
 
-def get_gsheet_worksheet():
+def set_cloud_sync_warning(message):
+    st.session_state.cloud_sync_warning = message
+
+
+def clear_cloud_sync_warning():
+    st.session_state.cloud_sync_warning = None
+
+
+def unique_trial_ids(trial_ids):
+    seen = set()
+    ordered = []
+    for trial_id in trial_ids:
+        if trial_id not in seen:
+            ordered.append(trial_id)
+            seen.add(trial_id)
+    return ordered
+
+
+def mark_pending_sync(trial_ids):
+    st.session_state.pending_sync_trial_ids = unique_trial_ids(
+        st.session_state.pending_sync_trial_ids + list(trial_ids)
+    )
+
+
+def clear_pending_sync(trial_ids):
+    cleared = set(trial_ids)
+    st.session_state.pending_sync_trial_ids = [
+        trial_id
+        for trial_id in st.session_state.pending_sync_trial_ids
+        if trial_id not in cleared
+    ]
+
+
+def run_gsheets_call(operation_name, callback, retries=3, base_delay=0.75):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            result = callback()
+            clear_cloud_sync_warning()
+            return result
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries - 1:
+                time.sleep(base_delay * (attempt + 1))
+
+    set_cloud_sync_warning(
+        f"Google Sheets sync is temporarily unavailable, so some responses may not be "
+        f"saved to the shared sheet right away. You can keep going and use "
+        f"'Download responses' as a backup."
+    )
+    return None
+
+
+def build_gsheet_worksheet():
     gsheets_config = get_gsheets_config()
     if not gsheets_config or gspread is None or Credentials is None:
         return None
@@ -160,13 +220,19 @@ def get_gsheet_worksheet():
     return spreadsheet.sheet1
 
 
+def get_gsheet_worksheet():
+    return run_gsheets_call("connect to Google Sheets", build_gsheet_worksheet)
+
+
 def read_responses_df():
     if get_storage_mode() == "gsheets":
         worksheet = get_gsheet_worksheet()
         if worksheet is None:
             return pd.DataFrame(columns=get_response_columns())
 
-        records = worksheet.get_all_records()
+        records = run_gsheets_call("read responses from Google Sheets", worksheet.get_all_records)
+        if records is None:
+            return pd.DataFrame(columns=get_response_columns())
         if not records:
             return pd.DataFrame(columns=get_response_columns())
 
@@ -195,7 +261,9 @@ def load_saved_answers_and_rows(pid):
         if worksheet is None:
             return {}, {}, 2
 
-        records = worksheet.get_all_records()
+        records = run_gsheets_call("load saved responses from Google Sheets", worksheet.get_all_records)
+        if records is None:
+            return {}, {}, 2
         if not records:
             return {}, {}, 2
 
@@ -247,8 +315,12 @@ def write_responses_df(response_df):
         if not ordered_df.empty:
             safe_df = ordered_df.fillna("")
             rows.extend(safe_df.astype(str).values.tolist())
-        worksheet.clear()
-        worksheet.update(rows)
+        result = run_gsheets_call(
+            "rewrite responses in Google Sheets",
+            lambda: (worksheet.clear(), worksheet.update(rows))
+        )
+        if result is None:
+            return
         return
 
     ordered_df.to_csv(RESPONSES_CSV, index=False)
@@ -312,6 +384,8 @@ if not participant_id:
 storage_warning = gsheets_status_message()
 if storage_warning:
     st.warning(storage_warning)
+elif st.session_state.cloud_sync_warning:
+    st.warning(st.session_state.cloud_sync_warning)
 
 st.sidebar.write(f"Responses saved to:")
 if get_storage_mode() == "gsheets":
@@ -436,23 +510,47 @@ def persist_current_answer():
 
     worksheet = get_gsheet_worksheet()
     if worksheet is None:
+        mark_pending_sync([trial_id])
         return
 
-    saved_answer = st.session_state.answers.get(trial_id)
-    if not saved_answer:
-        return
+    trial_ids_to_sync = unique_trial_ids(st.session_state.pending_sync_trial_ids + [trial_id])
+    synced_trial_ids = []
 
-    row_values = [str(saved_answer.get(column, "")) for column in get_response_columns()]
-    row_number = st.session_state.answer_rows.get(trial_id)
+    for pending_trial_id in trial_ids_to_sync:
+        saved_answer = st.session_state.answers.get(pending_trial_id)
+        if not saved_answer:
+            synced_trial_ids.append(pending_trial_id)
+            continue
 
-    if row_number:
-        worksheet.update(f"A{row_number}:J{row_number}", [row_values])
-        return
+        row_values = [str(saved_answer.get(column, "")) for column in get_response_columns()]
+        row_number = st.session_state.answer_rows.get(pending_trial_id)
 
-    next_row = st.session_state.next_sheet_row
-    worksheet.append_row(row_values)
-    st.session_state.answer_rows[trial_id] = next_row
-    st.session_state.next_sheet_row += 1
+        if row_number:
+            result = run_gsheets_call(
+                "update a response in Google Sheets",
+                lambda row_number=row_number, row_values=row_values: (
+                    worksheet.update(f"A{row_number}:J{row_number}", [row_values])
+                )
+            )
+            if result is None:
+                break
+        else:
+            next_row = st.session_state.next_sheet_row
+            result = run_gsheets_call(
+                "append a response to Google Sheets",
+                lambda row_values=row_values: worksheet.append_row(row_values)
+            )
+            if result is None:
+                break
+            st.session_state.answer_rows[pending_trial_id] = next_row
+            st.session_state.next_sheet_row += 1
+
+        synced_trial_ids.append(pending_trial_id)
+
+    if synced_trial_ids:
+        clear_pending_sync(synced_trial_ids)
+    if trial_id not in synced_trial_ids:
+        mark_pending_sync([trial_id])
 
 
 def current_participant_export():
