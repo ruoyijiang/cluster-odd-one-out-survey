@@ -1,4 +1,6 @@
 import os
+import re
+import logging
 import time
 import hashlib
 from datetime import datetime
@@ -218,15 +220,18 @@ def run_gsheets_call(operation_name, callback, retries=3, base_delay=0.75):
     for attempt in range(retries):
         try:
             result = callback()
-            clear_cloud_sync_warning()
             return result
         except Exception as exc:
             last_error = exc
             if attempt < retries - 1:
                 time.sleep(base_delay * (attempt + 1))
 
+    logging.getLogger(__name__).error(
+        "Google Sheets %s failed after %s attempts", operation_name, retries,
+        exc_info=(type(last_error), last_error, last_error.__traceback__),
+    )
     set_cloud_sync_warning(
-        f"Google Sheets sync is temporarily unavailable, so some responses may not be "
+        f"Google Sheets could not {operation_name} ({type(last_error).__name__}). Some responses may not be "
         f"saved to the shared sheet right away. You can keep going and use "
         f"'Download responses' as a backup."
     )
@@ -369,7 +374,7 @@ def write_responses_df(response_df):
             rows.extend(safe_df.astype(str).values.tolist())
         result = run_gsheets_call(
             "rewrite responses in Google Sheets",
-            lambda: (worksheet.clear(), worksheet.update(rows))
+            lambda: (worksheet.clear(), worksheet.update(values=rows))
         )
         if result is None:
             return
@@ -397,20 +402,26 @@ def ensure_participant_rows(pid, trial_order, answer_rows):
     if not answer_rows and st.session_state.next_sheet_row <= 2:
         header_result = run_gsheets_call(
             "ensure Google Sheets response header",
-            lambda: worksheet.update("A1:J1", [get_response_columns()])
+            lambda: worksheet.update(range_name="A1:J1", values=[get_response_columns()])
         )
         if header_result is None:
             return answer_rows, None
 
-    start_row = st.session_state.next_sheet_row
     values = [row_to_values(row) for row in missing_rows]
     result = run_gsheets_call(
         "prefill participant response rows in Google Sheets",
-        lambda values=values: worksheet.append_rows(values, value_input_option="USER_ENTERED")
+        lambda values=values: worksheet.append_rows(values, value_input_option="RAW", table_range="A:J")
     )
     if result is None:
         return answer_rows, None
 
+    # Google Sheets is authoritative: another session may have appended rows.
+    written_range = result.get("updates", {}).get("updatedRange", "")
+    match = re.search(r"!?\$?A\$?(\d+):\$?J\$?(\d+)$", written_range)
+    if not match or int(match.group(2)) - int(match.group(1)) + 1 != len(missing_rows):
+        set_cloud_sync_warning("Google Sheets did not confirm the new row locations. Please retry saving.")
+        return answer_rows, None
+    start_row = int(match.group(1))
     updated_rows = dict(answer_rows)
     for offset, row in enumerate(missing_rows):
         updated_rows[row["trial_id"]] = start_row + offset
@@ -603,19 +614,23 @@ def write_all_answers():
 
 
 def persist_current_answer():
-    if selected is None:
-        return
+    if selected is None and not st.session_state.pending_sync_trial_ids:
+        return True
 
     if get_storage_mode() != "gsheets":
         write_all_answers()
-        return
+        return True
 
     worksheet = get_gsheet_worksheet()
     if worksheet is None:
-        mark_pending_sync([trial_id])
-        return
+        if selected is not None:
+            mark_pending_sync([trial_id])
+        return False
 
-    trial_ids_to_sync = unique_trial_ids(st.session_state.pending_sync_trial_ids + [trial_id])
+    trial_ids_to_sync = unique_trial_ids(
+        st.session_state.pending_sync_trial_ids + ([trial_id] if selected is not None else [])
+    )
+    mark_pending_sync(trial_ids_to_sync)
     synced_trial_ids = []
 
     for pending_trial_id in trial_ids_to_sync:
@@ -645,27 +660,34 @@ def persist_current_answer():
         result = run_gsheets_call(
             "update a response in Google Sheets",
             lambda row_number=row_number, row_values=row_values: (
-                worksheet.update(f"A{row_number}:J{row_number}", [row_values])
+                worksheet.update(range_name=f"A{row_number}:J{row_number}", values=[row_values])
             )
         )
         if result is None:
+            break
+        if result.get("updatedCells") != len(row_values):
+            set_cloud_sync_warning("Google Sheets did not confirm the complete answer was saved. Please retry.")
             break
 
         synced_trial_ids.append(pending_trial_id)
 
     if synced_trial_ids:
         clear_pending_sync(synced_trial_ids)
-    if trial_id not in synced_trial_ids:
-        mark_pending_sync([trial_id])
+    if not st.session_state.pending_sync_trial_ids:
+        clear_cloud_sync_warning()
+        return True
+    return False
 
 
 def current_participant_export():
     export_df = responses_for_participant(participant_id)
-    if export_df.empty:
-        export_df = pd.DataFrame(list(st.session_state.answers.values()))
+    local_df = pd.DataFrame(list(st.session_state.answers.values()))
+    # Include unsynced answers even when the shared sheet already has blank rows.
+    export_df = pd.concat([export_df, local_df], ignore_index=True)
     if export_df.empty:
         return b""
-
+    export_df["trial_id"] = export_df["trial_id"].apply(normalize_trial_id)
+    export_df = export_df.drop_duplicates(subset=["trial_id"], keep="last")
     export_df = export_df.sort_values(["trial_number", "trial_id"])
     return export_df.to_csv(index=False).encode("utf-8")
 
@@ -786,22 +808,26 @@ with left:
 with middle:
     if st.button("Save progress"):
         save_current_answer()
-        persist_current_answer()
-        st.success("Progress saved.")
+        if persist_current_answer():
+            st.success("Progress saved.")
+        else:
+            st.error(st.session_state.cloud_sync_warning or "Some answers have not synced. Keep this tab open and download responses as a backup.")
 
 with right:
     next_label = "Finish" if trial_idx + 1 == n_trials else "Continue"
 
     if st.button(next_label):
         save_current_answer()
-        persist_current_answer()
+        saved = persist_current_answer()
 
         if trial_idx + 1 < n_trials:
             st.session_state.trial_idx += 1
             st.session_state.pending_jump_value = st.session_state.trial_idx + 1
             st.rerun()
-        else:
+        elif saved:
             st.success("Evaluation complete. Thank you.")
+        else:
+            st.error(st.session_state.cloud_sync_warning or "Some answers have not synced. Please retry saving.")
 
 st.caption("Keyboard shortcuts: press 1/2/3 to choose, J for Back, K for Continue.")
 enable_keyboard_shortcuts()
